@@ -960,3 +960,69 @@ func (s *contractService) RolloverContract(
 
 	return newContract, tx, nil
 }
+
+// validateContractParameters implements a more robust validation of contract parameters
+func (s *contractService) validateContractParameters(
+	ctx context.Context,
+	contractType hashperp.ContractType,
+	strikeRate float64,
+	expiryBlockHeight uint64,
+	size float64,
+) error {
+	// 1. Validate contract type
+	if contractType != hashperp.CALL && contractType != hashperp.PUT {
+		return fmt.Errorf("%w: contract type must be CALL or PUT, got %s", ErrInvalidParameters, contractType)
+	}
+
+	// 2. Validate strike rate - must be positive and reasonable
+	if strikeRate <= 0 {
+		return fmt.Errorf("%w: strike rate must be positive", ErrInvalidParameters)
+	}
+	
+	// Add upper bound to prevent unreasonable values that might indicate errors
+	if strikeRate > 1000 {
+		return fmt.Errorf("%w: strike rate too high (> 1000), please verify", ErrInvalidParameters)
+	}
+
+	// 3. Validate size - must be positive and within reasonable bounds
+	if size <= 0 {
+		return fmt.Errorf("%w: size must be positive", ErrInvalidParameters)
+	}
+	
+	// Add minimum size to prevent dust contracts
+	const minSize = 0.001 // 0.001 BTC
+	if size < minSize {
+		return fmt.Errorf("%w: size must be at least %v BTC", ErrInvalidParameters, minSize)
+	}
+	
+	// Add upper bound to prevent unreasonable values
+	const maxSize = 100 // 100 BTC
+	if size > maxSize {
+		return fmt.Errorf("%w: size exceeds maximum allowed (%v BTC)", ErrInvalidParameters, maxSize)
+	}
+
+	// 4. Validate expiry block height
+	currentBlockHeight, err := s.btcClient.GetCurrentBlockHeight(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get current block height: %w", err)
+	}
+	s.blockHeight = currentBlockHeight // Update cached block height
+
+	if expiryBlockHeight <= currentBlockHeight {
+		return fmt.Errorf("%w: expiry block height must be in the future", ErrInvalidBlockHeight)
+	}
+
+	// Validate minimum contract duration (e.g., at least 100 blocks ~16 hours)
+	const minBlockDuration = 100
+	if expiryBlockHeight < currentBlockHeight+minBlockDuration {
+		return fmt.Errorf("%w: contract duration too short, minimum %d blocks", ErrInvalidParameters, minBlockDuration)
+	}
+	
+	// Validate maximum contract duration (e.g., at most 52560 blocks ~1 year)
+	const maxBlockDuration = 52560 // ~1 year at 10 min per block
+	if expiryBlockHeight > currentBlockHeight+maxBlockDuration {
+		return fmt.Errorf("%w: contract duration too long, maximum %d blocks (~1 year)", ErrInvalidParameters, maxBlockDuration)
+	}
+
+	return nil
+}

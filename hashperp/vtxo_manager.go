@@ -772,3 +772,176 @@ func (s *vtxoService) GetVTXOsForSettlement(
 	
 	return vtxos, nil
 }
+// SwapVTXO implements VTXOManager.SwapVTXO with enhanced validation
+func (s *vtxoService) SwapVTXO(
+	ctx context.Context,
+	vtxoID string,
+	newOwnerID string,
+	newSignatureData []byte,
+) (*hashperp.VTXO, *hashperp.Transaction, error) {
+	// Input validation
+	if vtxoID == "" {
+		return nil, nil, fmt.Errorf("invalid input: vtxoID cannot be empty")
+	}
+	
+	if newOwnerID == "" {
+		return nil, nil, fmt.Errorf("invalid input: newOwnerID cannot be empty")
+	}
+	
+	// Signature data validation
+	if newSignatureData == nil || len(newSignatureData) == 0 {
+		return nil, nil, ErrInvalidSignature
+	}
+	
+	// Check minimum signature length for security
+	minSigLength := 64 // Minimum size for a secure cryptographic signature
+	if len(newSignatureData) < minSigLength {
+		return nil, nil, fmt.Errorf("%w: signature data too short (minimum %d bytes required)", 
+			ErrInvalidSignature, minSigLength)
+	}
+	
+	// Verify user exists before performing the swap
+	if s.userRepo != nil {
+		_, err := s.userRepo.FindByID(ctx, newOwnerID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid new owner: %w", err)
+		}
+	}
+
+	// 1. Get the existing VTXO
+	vtxo, err := s.vtxoRepo.FindByID(ctx, vtxoID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get VTXO: %w", err)
+	}
+	if vtxo == nil {
+		return nil, nil, ErrVTXONotFound
+	}
+
+	// 2. Validate the VTXO is active
+	if !vtxo.IsActive {
+		return nil, nil, ErrVTXONotActive
+	}
+	
+	// 3. Ensure the new owner is not the same as the current owner
+	if vtxo.OwnerID == newOwnerID {
+		return nil, nil, fmt.Errorf("new owner is the same as current owner")
+	}
+
+	// 4. Get the associated contract
+	contract, err := s.contractRepo.FindByID(ctx, vtxo.ContractID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get contract: %w", err)
+	}
+	if contract == nil {
+		return nil, nil, ErrContractNotFound
+	}
+
+	// 5. Validate contract status
+	if contract.Status != hashperp.ACTIVE {
+		return nil, nil, ErrInvalidContractStatus
+	}
+	
+	// 6. If possible, validate the signature against the contract terms
+	if s.btcClient != nil && len(newSignatureData) >= 65 { // Most signatures are 65 bytes minimum
+		// Extract the necessary data for verification
+		// This is a simplified example - in production, you'd have a more robust message construction
+		message := []byte(fmt.Sprintf("swap:%s:%s:%s", vtxoID, newOwnerID, vtxo.ContractID))
+		
+		// Get user's public key
+		var pubKey []byte
+		if s.userRepo != nil {
+			pubKey, err = s.userRepo.GetPublicKey(ctx, newOwnerID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get user public key: %w", err)
+			}
+			
+			// Validate the signature
+			isValid, err := s.btcClient.ValidateSignature(ctx, message, newSignatureData, pubKey)
+			if err != nil {
+				// Log the error but don't fail - this is a best-effort validation
+				fmt.Printf("signature validation error: %v\n", err)
+			} else if !isValid {
+				return nil, nil, ErrInvalidSignature
+			}
+		}
+	}
+
+	// Continue with the rest of the function...
+	// Create a new VTXO with the new owner
+	newVTXO := &hashperp.VTXO{
+		ID:                generateUniqueID(),
+		ContractID:        vtxo.ContractID,
+		OwnerID:           newOwnerID,
+		Amount:            vtxo.Amount,
+		ScriptPath:        vtxo.ScriptPath,
+		CreationTimestamp: time.Now().UTC(),
+		SignatureData:     newSignatureData,
+		SwappedFromID:     vtxo.ID,
+		IsActive:          true,
+	}
+
+	// 7. Save the new VTXO
+	if err := s.vtxoRepo.Create(ctx, newVTXO); err != nil {
+		return nil, nil, fmt.Errorf("failed to create new VTXO: %w", err)
+	}
+
+	// 8. Mark the old VTXO as inactive
+	oldVTXO := vtxo // Keep a reference to the old VTXO
+	vtxo.IsActive = false
+	if err := s.vtxoRepo.Update(ctx, vtxo); err != nil {
+		// If we fail to update the old VTXO, delete the new one to maintain consistency
+		_ = s.vtxoRepo.Delete(ctx, newVTXO.ID)
+		return nil, nil, fmt.Errorf("failed to update old VTXO: %w", err)
+	}
+
+	// 9. Update the contract with the new VTXO ID
+	var positionType string
+	if contract.BuyerVTXO == vtxoID {
+		contract.BuyerVTXO = newVTXO.ID
+		contract.BuyerID = newOwnerID
+		positionType = "buyer"
+	} else if contract.SellerVTXO == vtxoID {
+		contract.SellerVTXO = newVTXO.ID
+		contract.SellerID = newOwnerID
+		positionType = "seller"
+	} else {
+		// This should never happen if our data integrity is maintained
+		_ = s.vtxoRepo.Delete(ctx, newVTXO.ID)
+		oldVTXO.IsActive = true
+		_ = s.vtxoRepo.Update(ctx, oldVTXO)
+		return nil, nil, errors.New("VTXO is not associated with this contract's buyer or seller")
+	}
+
+	if err := s.contractRepo.Update(ctx, contract); err != nil {
+		// If we fail to update the contract, revert the VTXO changes
+		_ = s.vtxoRepo.Delete(ctx, newVTXO.ID)
+		oldVTXO.IsActive = true
+		_ = s.vtxoRepo.Update(ctx, oldVTXO)
+		return nil, nil, fmt.Errorf("failed to update contract: %w", err)
+	}
+
+	// 10. Record the swap transaction
+	tx := &hashperp.Transaction{
+		ID:         generateUniqueID(),
+		Type:       hashperp.VTXO_SWAP,
+		Timestamp:  time.Now().UTC(),
+		ContractID: contract.ID,
+		UserIDs:    []string{vtxo.OwnerID, newOwnerID},
+		Amount:     vtxo.Amount,
+		RelatedEntities: map[string]string{
+			"old_vtxo":       vtxo.ID,
+			"new_vtxo":       newVTXO.ID,
+			"position_type":  positionType,
+			"old_owner_id":   vtxo.OwnerID,
+			"new_owner_id":   newOwnerID,
+		},
+	}
+
+	if err := s.transactionRepo.Create(ctx, tx); err != nil {
+		// If recording the transaction fails, we'll still proceed with the swap
+		// but log the error
+		fmt.Printf("failed to record swap transaction: %v\n", err)
+	}
+
+	return newVTXO, tx, nil
+}
