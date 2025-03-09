@@ -6,13 +6,12 @@ import (
 	"context"
 	"time"
 )
-
 // HashRateData represents Bitcoin network hash rate information used for pricing and settlement
 type HashRateData struct {
-	Timestamp     time.Time `json:"timestamp"`
-	BlockHeight   uint64    `json:"block_height"`
-	HashRate      float64   `json:"hash_rate"`      // Current hash rate in PH/s
-	BTCPerPHPerDay float64   `json:"btc_ph_day"`    // BTC per PetaHash per Day rate
+	Timestamp      time.Time `json:"timestamp"`
+	BlockHeight    uint64    `json:"block_height"`
+	HashRate       float64   `json:"hash_rate"`       // Current hash rate in PH/s
+	BTCPerPHPerDay float64   `json:"btc_ph_day"`      // BTC per PetaHash per Day rate
 }
 
 // ContractType defines whether a contract is a CALL or PUT option
@@ -27,30 +26,39 @@ const (
 type ContractStatus string
 
 const (
-	PENDING    ContractStatus = "PENDING"    // Contract created but not yet active
-	ACTIVE     ContractStatus = "ACTIVE"     // Contract is currently active
-	SETTLED    ContractStatus = "SETTLED"    // Contract has been settled
-	EXITED     ContractStatus = "EXITED"     // Contract was exited before expiration
-	ROLLED_OVER ContractStatus = "ROLLED_OVER" // Contract was rolled over to a new contract
+	PENDING            ContractStatus = "PENDING"      // Contract created but not yet active
+	ACTIVE             ContractStatus = "ACTIVE"       // Contract is currently active
+	SETTLED            ContractStatus = "SETTLED"      // Contract has been settled
+	EXITED             ContractStatus = "EXITED"       // Contract was exited before expiration
+	ROLLED_OVER        ContractStatus = "ROLLED_OVER"  // Contract was rolled over to a new contract
+	SETTLEMENT_PENDING ContractStatus = "SETTLEMENT_PENDING" // Contract is pending settlement
+	SETTLEMENT_IN_PROGRESS ContractStatus = "SETTLEMENT_IN_PROGRESS" // Settlement is in progress
+	COMPLETED          ContractStatus = "COMPLETED"    // Contract is fully completed
+	CLOSE_TO_EXPIRY    ContractStatus = "CLOSE_TO_EXPIRY" // Contract is close to expiration
 )
 
 // Contract represents a hash rate perpetual futures contract
 type Contract struct {
-	ID               string        `json:"id"`
-	ContractType     ContractType  `json:"contract_type"`
-	StrikeRate       float64       `json:"strike_rate"`      // Strike rate in BTC/PH/day
-	ExpiryBlockHeight uint64        `json:"expiry_block_height"`
-	ExpiryDate       time.Time     `json:"expiry_date"`     // Human-readable expiry date
-	CreationTime     time.Time     `json:"creation_time"`
-	Status           ContractStatus`json:"status"`
-	BuyerID          string        `json:"buyer_id"`
-	SellerID         string        `json:"seller_id"`
-	Size             float64       `json:"size"`            // Contract size in BTC
-	BuyerVTXO        string        `json:"buyer_vtxo"`      // VTXO identifier for buyer
-	SellerVTXO       string        `json:"seller_vtxo"`     // VTXO identifier for seller
-	SettlementTx     string        `json:"settlement_tx,omitempty"` // Settlement transaction ID if settled
-	SettlementRate   float64       `json:"settlement_rate,omitempty"` // Settlement rate at contract completion
-	RolledOverToID   string        `json:"rolled_over_to_id,omitempty"` // ID of contract this rolled into
+	ID                 string         `json:"id"`
+	ContractType       ContractType   `json:"contract_type"`
+	HeightStrike       float64        `json:"height_strike"`
+	TimeStrike         float64        `json:"time_strike"`
+	ExpiryBlockHeight  uint64         `json:"expiry_block_height"`
+	ExpiryDate         time.Time      `json:"expiry_date"`     // Human-readable expiry date
+	CreationTime       time.Time      `json:"creation_time"`
+	Status             ContractStatus `json:"status"`
+	BuyerID            string         `json:"buyer_id"`
+	SellerID           string         `json:"seller_id"`
+	Size               float64        `json:"size"`            // Contract size in BTC
+	BuyerVTXO          string         `json:"buyer_vtxo"`      // VTXO identifier for buyer
+	SellerVTXO         string         `json:"seller_vtxo"`     // VTXO identifier for seller
+	SettlementTx       string         `json:"settlement_tx,omitempty"` // Settlement transaction ID if settled
+	RolledOverToID     string         `json:"rolled_over_to_id,omitempty"` // ID of contract this rolled into
+	CompletionTimestamp time.Time     `json:"completion_timestamp,omitempty"` // When the contract was completed
+	BuyerExited        bool           `json:"buyer_exited,omitempty"` // Whether the buyer has exited
+	SellerExited       bool           `json:"seller_exited,omitempty"` // Whether the seller has exited
+	BuyerExitTxHash    string         `json:"buyer_exit_tx_hash,omitempty"` // Exit transaction hash for buyer
+	SellerExitTxHash   string         `json:"seller_exit_tx_hash,omitempty"` // Exit transaction hash for seller
 }
 
 // VTXO represents a Virtual Transaction Output used in the contract system
@@ -63,10 +71,14 @@ type VTXO struct {
 	CreationTimestamp time.Time `json:"creation_timestamp"`
 	SignatureData     []byte    `json:"signature_data"`    // Signature data for the VTXO
 	SwappedFromID     string    `json:"swapped_from_id,omitempty"` // Previous VTXO ID if swapped
+	RolledFromID      string    `json:"rolled_from_id,omitempty"` // Previous VTXO ID if rolled from
+	RolledToID        string    `json:"rolled_to_id,omitempty"` // Next VTXO ID if rolled to
 	IsActive          bool      `json:"is_active"`
+	ExitTxHash        string    `json:"exit_tx_hash,omitempty"` // Exit transaction hash if exited
+	ExitTimestamp     time.Time `json:"exit_timestamp,omitempty"` // When the VTXO was exited
 }
 
-// Order represents a buy or sell order in the order book
+// OrderType represents whether an order is a buy or sell order
 type OrderType string
 
 const (
@@ -86,57 +98,88 @@ const (
 
 // Order represents an order in the orderbook
 type Order struct {
-	ID               string      `json:"id"`
-	UserID           string      `json:"user_id"`
-	OrderType        OrderType   `json:"order_type"`
-	ContractType     ContractType`json:"contract_type"`
-	StrikeRate       float64     `json:"strike_rate"`      // Strike rate in BTC/PH/day
-	ExpiryBlockHeight uint64      `json:"expiry_block_height,omitempty"`
-	ExpiryDate       time.Time   `json:"expiry_date,omitempty"` // Human-readable expiry for UI
-	Size             float64     `json:"size"`             // Size in BTC
-	Status           OrderStatus `json:"status"`
-	CreationTime     time.Time   `json:"creation_time"`
-	MatchedOrderID   string      `json:"matched_order_id,omitempty"`
-	ResultingContractID string    `json:"resulting_contract_id,omitempty"`
+	ID                 string      `json:"id"`
+	UserID             string      `json:"user_id"`
+	OrderType          OrderType   `json:"order_type"`
+	ContractType       ContractType`json:"contract_type"`
+	StrikeRate         float64     `json:"strike_rate"`      // Strike rate in BTC/PH/day
+	ExpiryBlockHeight  uint64      `json:"expiry_block_height,omitempty"`
+	ExpiryDate         time.Time   `json:"expiry_date,omitempty"` // Human-readable expiry for UI
+	Size               float64     `json:"size"`             // Size in BTC
+	Status             OrderStatus `json:"status"`
+	CreationTime       time.Time   `json:"creation_time"`
+	MatchedOrderID     string      `json:"matched_order_id,omitempty"`
+	ResultingContractID string     `json:"resulting_contract_id,omitempty"`
 }
+
+// SwapOfferStatus represents the current status of a swap offer
+type SwapOfferStatus string
+
+const (
+	OFFER_OPEN     SwapOfferStatus = "OPEN"
+	OFFER_ACCEPTED SwapOfferStatus = "ACCEPTED"
+	OFFER_EXPIRED  SwapOfferStatus = "EXPIRED"
+	OFFER_CANCELED SwapOfferStatus = "CANCELED"
+	OFFER_REJECTED SwapOfferStatus = "REJECTED"
+)
 
 // SwapOffer represents an offer to swap a VTXO with another user
 type SwapOffer struct {
-	ID           string    `json:"id"`
-	OfferorID    string    `json:"offeror_id"`     // User offering the swap
-	VTXOID       string    `json:"vtxo_id"`        // VTXO being offered
-	ContractID   string    `json:"contract_id"`
-	OfferedRate  float64   `json:"offered_rate"`   // Rate at which swap is offered
-	CreationTime time.Time `json:"creation_time"`
-	ExpiryTime   time.Time `json:"expiry_time"`
-	Status       string    `json:"status"`         // "OPEN", "ACCEPTED", "EXPIRED", "CANCELED"
-	AcceptorID   string    `json:"acceptor_id,omitempty"` // User who accepted the offer
+	ID               string          `json:"id"`
+	OfferorID        string          `json:"offeror_id"`     // User offering the swap
+	VTXOID           string          `json:"vtxo_id"`        // VTXO being offered
+	ContractID       string          `json:"contract_id"`
+	OfferedRate      float64         `json:"offered_rate"`   // Rate at which swap is offered
+	CreationTime     time.Time       `json:"creation_time"`
+	ExpiryTime       time.Time       `json:"expiry_time"`
+	Status           string          `json:"status"`         // "OPEN", "ACCEPTED", "EXPIRED", "CANCELED"
+	AcceptorID       string          `json:"acceptor_id,omitempty"` // User who accepted the offer
+	TargetUserID     string          `json:"target_user_id,omitempty"` // Specific user the offer is for
+	SwapType         string          `json:"swap_type,omitempty"` // Type of swap (position_swap, vtxo_swap, etc.)
+	RelatedEntities  map[string]string `json:"related_entities,omitempty"` // Additional metadata
 }
 
-// Transaction represents a record of all on-chain and off-chain transactions
+// TransactionType represents the type of transaction
 type TransactionType string
 
 const (
-	CONTRACT_CREATION TransactionType = "CONTRACT_CREATION"
+	CONTRACT_CREATION   TransactionType = "CONTRACT_CREATION"
 	CONTRACT_SETTLEMENT TransactionType = "CONTRACT_SETTLEMENT"
-	VTXO_SWAP TransactionType = "VTXO_SWAP"
-	CONTRACT_ROLLOVER TransactionType = "CONTRACT_ROLLOVER"
+	VTXO_SWAP           TransactionType = "VTXO_SWAP"
+	VTXO_ROLLOVER       TransactionType = "VTXO_ROLLOVER"
+	CONTRACT_ROLLOVER   TransactionType = "CONTRACT_ROLLOVER"
 	EXIT_PATH_EXECUTION TransactionType = "EXIT_PATH_EXECUTION"
 )
 
 // Transaction represents a transaction in the system
 type Transaction struct {
-	ID              string         `json:"id"`
-	Type            TransactionType`json:"type"`
-	Timestamp       time.Time      `json:"timestamp"`
-	ContractID      string         `json:"contract_id,omitempty"`
-	UserIDs         []string       `json:"user_ids"`
-	TxHash          string         `json:"tx_hash,omitempty"`    // On-chain transaction hash, if applicable
-	Amount          float64        `json:"amount"`              // Amount in BTC
-	BTCPerPHPerDay  float64        `json:"btc_ph_day,omitempty"`// Rate at transaction time
-	BlockHeight     uint64         `json:"block_height,omitempty"`
+	ID              string           `json:"id"`
+	Type            TransactionType  `json:"type"`
+	Timestamp       time.Time        `json:"timestamp"`
+	ContractID      string           `json:"contract_id,omitempty"`
+	UserIDs         []string         `json:"user_ids"`
+	TxHash          string           `json:"tx_hash,omitempty"`    // On-chain transaction hash, if applicable
+	Amount          float64          `json:"amount"`              // Amount in BTC
+	BTCPerPHPerDay  float64          `json:"btc_ph_day,omitempty"`// Rate at transaction time
+	BlockHeight     uint64           `json:"block_height,omitempty"`
+	Status          string           `json:"status,omitempty"`    // Transaction status
 	RelatedEntities map[string]string `json:"related_entities,omitempty"` // Related VTXOs, contracts, etc.
 }
+
+// SwapOfferMarketData represents aggregated market data for swap offers
+type SwapOfferMarketData struct {
+	ContractID      string    `json:"contract_id"`
+	Timestamp       time.Time `json:"timestamp"`
+	OpenOffersCount int       `json:"open_offers_count"`
+	HighestRate     float64   `json:"highest_rate"`
+	LowestRate      float64   `json:"lowest_rate"`
+	AverageRate     float64   `json:"average_rate"`
+	MedianRate      float64   `json:"median_rate"`
+	Volume24h       float64   `json:"volume_24h"`
+	BuyerOffers     int       `json:"buyer_offers"`
+	SellerOffers    int       `json:"seller_offers"`
+}
+
 
 // =============================================================================
 // CONTRACT MANAGEMENT API INTERFACES

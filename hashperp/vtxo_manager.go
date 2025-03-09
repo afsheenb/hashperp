@@ -1,11 +1,20 @@
-
 package hashperp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
+)
+
+// These constants define the possible states for a contract during settlement
+const (
+	SETTLEMENT_PENDING     ContractStatus = "SETTLEMENT_PENDING"
+	SETTLEMENT_IN_PROGRESS ContractStatus = "SETTLEMENT_IN_PROGRESS"
+	COMPLETED              ContractStatus = "COMPLETED"
+	CLOSE_TO_EXPIRY        ContractStatus = "CLOSE_TO_EXPIRY"
 )
 
 // vtxoService implements the VTXOManager interface
@@ -273,14 +282,45 @@ func (s *vtxoService) CreatePresignedExitTransaction(
 		return "", ErrInvalidContractStatus
 	}
 
-	// 5. Generate pre-signed exit transaction
-	// In a real implementation, this would create a Bitcoin transaction
-	// For this example, we'll just generate an ID
-	exitTxID := fmt.Sprintf("pre_signed_exit_%s", generateUniqueID())
+	// 5. Validate signature data
+	if signatureData == nil || len(signatureData) == 0 {
+		return "", ErrInvalidSignature
+	}
 
-	// 6. Record the pre-signed exit transaction (in a real implementation,
-	// this might be stored for later use in case of disputes)
-	// ...
+	// 6. Generate the exit script based on the VTXO's script path
+	exitScript, err := s.scriptGen.GenerateExitScript(ctx, vtxo.ScriptPath, signatureData)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate exit script: %w", err)
+	}
+
+	// 7. Generate a unique ID for the pre-signed transaction
+	exitTxID := generateExitTransactionID(vtxo, contract)
+
+	// 8. Store the pre-signed transaction in the database
+	// In a real implementation, this would store the actual transaction data
+	// For this example, we're just storing the ID
+	
+	// Create transaction record for reference
+	tx := &Transaction{
+		ID:         generateUniqueID(),
+		Type:       EXIT_PATH_EXECUTION,
+		Timestamp:  time.Now().UTC(),
+		ContractID: contract.ID,
+		UserIDs:    []string{vtxo.OwnerID},
+		Amount:     vtxo.Amount,
+		Status:     "PREPARED", // Special status for pre-signed transactions
+		RelatedEntities: map[string]string{
+			"vtxo_id":            vtxo.ID,
+			"exit_type":          "pre_signed",
+			"exit_tx_id":         exitTxID,
+			"owner_id":           vtxo.OwnerID,
+			"pre_signed_tx_data": exitScript,
+		},
+	}
+
+	if err := s.transactionRepo.Create(ctx, tx); err != nil {
+		return "", fmt.Errorf("failed to record pre-signed exit transaction: %w", err)
+	}
 
 	return exitTxID, nil
 }
@@ -319,22 +359,38 @@ func (s *vtxoService) ExecuteVTXOSweep(
 		return nil, ErrInvalidContractStatus
 	}
 
-	// 5. Generate the exit script based on the VTXO's script path
+	// 5. Get current block height for validation
+	currentBlockHeight, err := s.btcClient.GetCurrentBlockHeight(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current block height: %w", err)
+	}
+
+	// 6. Validate that VTXO sweep is allowed
+	// For emergency exits, we typically require the contract to be close to expiry
+	// or a certain timeout to have passed
+	if currentBlockHeight < contract.ExpiryBlockHeight - 144 { // 144 blocks = ~1 day
+		// Check if the contract has a special flag or status that allows early exit
+		if contract.Status != SETTLEMENT_PENDING {
+            return nil, errors.New("VTXO sweep is only allowed within 1 day of expiry or for settlement pending contracts")
+        }
+	}
+
+	// 7. Generate the emergency exit script based on the VTXO's script path
 	exitScript, err := s.scriptGen.GenerateExitScript(ctx, vtxo.ScriptPath, vtxo.SignatureData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate exit script: %w", err)
 	}
 
-	// 6. Create a Bitcoin transaction to execute the VTXO sweep
+	// 8. Create and broadcast a Bitcoin transaction to execute the VTXO sweep
 	// This would create and sign a transaction that sends the funds to the VTXO owner's address
-	txHash, err := s.btcClient.CreateAndBroadcastTx(ctx, exitScript, vtxo.Amount, vtxo.OwnerID)
+	txHash, err := s.btcClient.BroadcastTransaction(ctx, exitScript)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create and broadcast Bitcoin transaction: %w", err)
+		return nil, fmt.Errorf("failed to broadcast exit transaction: %w", err)
 	}
 
-	// 7. Mark the VTXO as inactive
+	// 9. Mark the VTXO as inactive
 	vtxo.IsActive = false
-	vtxo.ExitTxHash = txHash // Store the Bitcoin transaction hash
+	vtxo.ExitTxHash = txHash
 	vtxo.ExitTimestamp = time.Now().UTC()
 	
 	if err := s.vtxoRepo.Update(ctx, vtxo); err != nil {
@@ -344,7 +400,7 @@ func (s *vtxoService) ExecuteVTXOSweep(
 		// In a real implementation, this should be handled by a reconciliation process
 	}
 
-	// 8. Update the contract if necessary
+	// 10. Update the contract if necessary
 	// If this VTXO is part of the contract's core positions, update accordingly
 	if contract.BuyerVTXO == vtxoID || contract.SellerVTXO == vtxoID {
 		if contract.BuyerVTXO == vtxoID {
@@ -361,8 +417,8 @@ func (s *vtxoService) ExecuteVTXOSweep(
 		if contract.BuyerExited && contract.SellerExited {
 			contract.Status = COMPLETED
 			contract.CompletionTimestamp = time.Now().UTC()
-		} else {
-			// Otherwise, mark it as pending settlement
+		} else if contract.Status != SETTLEMENT_PENDING {
+			// Otherwise, mark it as pending settlement if not already
 			contract.Status = SETTLEMENT_PENDING
 		}
 		
@@ -372,21 +428,23 @@ func (s *vtxoService) ExecuteVTXOSweep(
 		}
 	}
 
-	// 9. Record the sweep transaction
+	// 11. Record the sweep transaction
 	tx := &Transaction{
 		ID:         generateUniqueID(),
 		Type:       EXIT_PATH_EXECUTION,
 		Timestamp:  time.Now().UTC(),
 		ContractID: contract.ID,
 		UserIDs:    []string{vtxo.OwnerID},
+		TxHash:     txHash,
 		Amount:     vtxo.Amount,
+		BlockHeight: currentBlockHeight,
 		RelatedEntities: map[string]string{
 			"vtxo_id":     vtxo.ID,
 			"exit_type":   "vtxo_sweep",
 			"owner_id":    vtxo.OwnerID,
 			"btc_tx_hash": txHash,
 		},
-		Status:     COMPLETED,
+		Status:     "COMPLETED",
 	}
 
 	if err := s.transactionRepo.Create(ctx, tx); err != nil {
@@ -396,6 +454,19 @@ func (s *vtxoService) ExecuteVTXOSweep(
 	}
 
 	return tx, nil
+}
+
+// Helper function to generate a unique ID for an exit transaction
+func generateExitTransactionID(vtxo *VTXO, contract *Contract) string {
+	// Create a unique identifier that's stable across implementations
+	data := fmt.Sprintf("exit_%s_%s_%s_%d",
+		vtxo.ID,
+		vtxo.OwnerID,
+		contract.ID,
+		time.Now().UnixNano())
+	
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
 }
 
 // VerifyVTXOOwnership implements VTXOManager.VerifyVTXOOwnership
@@ -584,7 +655,7 @@ func (s *vtxoService) RolloverVTXO(
 	// 13. Record the rollover transaction
 	tx := &Transaction{
 		ID:         generateUniqueID(),
-		Type:       VTXO_ROLLOVER,
+		Type:       CONTRACT_ROLLOVER,
 		Timestamp:  time.Now().UTC(),
 		ContractID: newContract.ID,
 		UserIDs:    []string{oldVTXO.OwnerID},
@@ -597,7 +668,7 @@ func (s *vtxoService) RolloverVTXO(
 			"position_type":   positionType,
 			"owner_id":        oldVTXO.OwnerID,
 		},
-		Status: COMPLETED,
+		Status: "COMPLETED",
 	}
 	
 	if err := s.transactionRepo.Create(ctx, tx); err != nil {
@@ -647,7 +718,7 @@ func (s *vtxoService) GetVTXOsForSettlement(
 	}
 	
 	// 2. Validate contract status is appropriate for settlement
-	if contract.Status != SETTLEMENT_PENDING && contract.Status != SETTLEMENT_IN_PROGRESS {
+	if contract.Status != ACTIVE && contract.Status != SETTLEMENT_PENDING && contract.Status != SETTLEMENT_IN_PROGRESS {
 		return nil, ErrInvalidContractStatus
 	}
 	
