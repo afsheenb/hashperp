@@ -17,13 +17,19 @@ const (
 	CLOSE_TO_EXPIRY        ContractStatus = "CLOSE_TO_EXPIRY"
 )
 
-// vtxoService implements the VTXOManager interface
+
+
+// Append to existing hashperp/vtxo_manager.go
+
+// Updated VTXOService struct to include user and pre-signed exit repositories
 type vtxoService struct {
-	vtxoRepo        VTXORepository
-	contractRepo    ContractRepository
-	transactionRepo TransactionRepository
-	scriptGen       ScriptGenerator
-	btcClient       BitcoinClient
+	vtxoRepo         VTXORepository
+	contractRepo     ContractRepository
+	transactionRepo  TransactionRepository
+	scriptGen        ScriptGenerator
+	btcClient        BitcoinClient
+	userRepo         UserRepository
+	preSignedExitRepo PreSignedExitRepository
 }
 
 // NewVTXOService creates a new VTXO service
@@ -33,13 +39,17 @@ func NewVTXOService(
 	transactionRepo TransactionRepository,
 	scriptGen ScriptGenerator,
 	btcClient BitcoinClient,
+	userRepo UserRepository,
+	preSignedExitRepo PreSignedExitRepository,
 ) VTXOManager {
 	return &vtxoService{
-		vtxoRepo:        vtxoRepo,
-		contractRepo:    contractRepo,
-		transactionRepo: transactionRepo,
-		scriptGen:       scriptGen,
-		btcClient:       btcClient,
+		vtxoRepo:         vtxoRepo,
+		contractRepo:     contractRepo,
+		transactionRepo:  transactionRepo,
+		scriptGen:        scriptGen,
+		btcClient:        btcClient,
+		userRepo:         userRepo,
+		preSignedExitRepo: preSignedExitRepo,
 	}
 }
 
@@ -282,25 +292,58 @@ func (s *vtxoService) CreatePresignedExitTransaction(
 		return "", ErrInvalidContractStatus
 	}
 
-	// 5. Validate signature data
+	// 5. Validate signature data is present
 	if signatureData == nil || len(signatureData) == 0 {
 		return "", ErrInvalidSignature
 	}
+	
+	// 6. Construct verification message
+	verificationMessage := fmt.Sprintf("exit:%s:%s:%d", 
+		vtxoID, vtxo.OwnerID, contract.ExpiryBlockHeight)
+	messageBytes := []byte(verificationMessage)
+	
+	// 7. Get user's public key from repository
+	userRepo := s.userRepo
+	pubKey, err := userRepo.GetPublicKey(ctx, vtxo.OwnerID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get user public key: %w", err)
+	}
+	
+	// 8. Verify the signature
+	isValid, err := s.btcClient.ValidateSignature(ctx, messageBytes, signatureData, pubKey)
+	if err != nil {
+		return "", fmt.Errorf("signature validation error: %w", err)
+	}
+	
+	if !isValid {
+		return "", ErrInvalidSignature
+	}
 
-	// 6. Generate the exit script based on the VTXO's script path
+	// 9. Generate the exit script
 	exitScript, err := s.scriptGen.GenerateExitScript(ctx, vtxo.ScriptPath, signatureData)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate exit script: %w", err)
 	}
 
-	// 7. Generate a unique ID for the pre-signed transaction
+	// 10. Generate a unique ID for the pre-signed transaction
 	exitTxID := generateExitTransactionID(vtxo, contract)
 
-	// 8. Store the pre-signed transaction in the database
-	// In a real implementation, this would store the actual transaction data
-	// For this example, we're just storing the ID
+	// 11. Store the pre-signed exit transaction
+	preSignedExit := &PreSignedExit{
+		ID:           generateUniqueID(),
+		VTXOID:       vtxoID,
+		ContractID:   vtxo.ContractID,
+		UserID:       vtxo.OwnerID,
+		ExitTxHex:    exitScript,
+		CreationTime: time.Now().UTC(),
+		IsUsed:       false,
+	}
+
+	if err := s.preSignedExitRepo.Create(ctx, preSignedExit); err != nil {
+		return "", fmt.Errorf("failed to store pre-signed exit transaction: %w", err)
+	}
 	
-	// Create transaction record for reference
+	// 12. Record the transaction
 	tx := &Transaction{
 		ID:         generateUniqueID(),
 		Type:       EXIT_PATH_EXECUTION,
@@ -308,13 +351,12 @@ func (s *vtxoService) CreatePresignedExitTransaction(
 		ContractID: contract.ID,
 		UserIDs:    []string{vtxo.OwnerID},
 		Amount:     vtxo.Amount,
-		Status:     "PREPARED", // Special status for pre-signed transactions
+		Status:     "PREPARED",
 		RelatedEntities: map[string]string{
-			"vtxo_id":            vtxo.ID,
-			"exit_type":          "pre_signed",
-			"exit_tx_id":         exitTxID,
-			"owner_id":           vtxo.OwnerID,
-			"pre_signed_tx_data": exitScript,
+			"vtxo_id":     vtxo.ID,
+			"exit_type":   "pre_signed",
+			"exit_tx_id":  exitTxID,
+			"owner_id":    vtxo.OwnerID,
 		},
 	}
 

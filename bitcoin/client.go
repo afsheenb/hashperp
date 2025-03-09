@@ -12,6 +12,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"math"
+	"bytes"
+	"encoding/binary"
+	"math/big"
+	
+	"github.com/btcsuite/btcd/btcec"
+)
 )
 
 	"github.com/hashperp/hashperp"
@@ -656,4 +662,136 @@ func (c *BitcoinClientImpl) VerifyChainTip(ctx context.Context) (uint64, error) 
 	}
 	
 	return blockCount, nil
+}
+
+
+// Append to existing bitcoin/client.go
+
+// ValidateSignature implements BitcoinClient.ValidateSignature
+func (c *BitcoinClientImpl) ValidateSignature(
+	ctx context.Context,
+	message []byte,
+	signature []byte,
+	pubKey []byte,
+) (bool, error) {
+	// Check for empty inputs
+	if len(message) == 0 {
+		return false, errors.New("empty message")
+	}
+	if len(signature) == 0 {
+		return false, errors.New("empty signature")
+	}
+	if len(pubKey) == 0 {
+		return false, errors.New("empty public key")
+	}
+
+	// 1. Convert the binary data to hex strings for Bitcoin RPC
+	messageHex := hex.EncodeToString(message)
+	signatureHex := hex.EncodeToString(signature)
+	pubKeyHex := hex.EncodeToString(pubKey)
+	
+	// 2. First convert the public key to an address
+	var address string
+	err := c.call(ctx, "getaddressfromkey", []interface{}{pubKeyHex}, &address)
+	if err != nil {
+		// Fallback to creating address with descriptor if getaddressfromkey is not supported
+		var addressInfo map[string]interface{}
+		descriptorParam := fmt.Sprintf("addr(%s)", pubKeyHex)
+		err = c.call(ctx, "deriveaddresses", []interface{}{descriptorParam}, &addressInfo)
+		if err != nil {
+			return verifySignatureWithCrypto(message, signature, pubKey)
+		}
+		addresses, ok := addressInfo["addresses"].([]interface{})
+		if !ok || len(addresses) == 0 {
+			return verifySignatureWithCrypto(message, signature, pubKey)
+		}
+		address = addresses[0].(string)
+	}
+	
+	// 3. Add message prefix according to Bitcoin signed message format
+	prefixedMessage := formatBitcoinMessage(string(message))
+	prefixedMessageHex := hex.EncodeToString([]byte(prefixedMessage))
+	
+	// 4. Verify the signature
+	var result bool
+	err = c.call(ctx, "verifymessage", []interface{}{address, signatureHex, prefixedMessageHex}, &result)
+	if err != nil {
+		// If the RPC call fails, use an alternative verification approach with raw signature verification
+		var verifyResult map[string]interface{}
+		err = c.call(ctx, "verifymessagewithpubkey", []interface{}{pubKeyHex, signatureHex, prefixedMessageHex}, &verifyResult)
+		if err != nil {
+			// If both RPC methods fail, fall back to our crypto implementation
+			return verifySignatureWithCrypto(message, signature, pubKey)
+		}
+		result, _ = verifyResult["verified"].(bool)
+	}
+	
+	return result, nil
+}
+
+// formatBitcoinMessage formats a message according to Bitcoin's signed message format
+func formatBitcoinMessage(message string) string {
+	prefix := "\x18Bitcoin Signed Message:\n"
+	messageLen := len(message)
+	var buf bytes.Buffer
+	buf.WriteString(prefix)
+	
+	// Add the length of the message as a Bitcoin varint
+	if messageLen < 253 {
+		buf.WriteByte(byte(messageLen))
+	} else if messageLen <= 0xffff {
+		buf.WriteByte(253)
+		binary.Write(&buf, binary.LittleEndian, uint16(messageLen))
+	} else if messageLen <= 0xffffffff {
+		buf.WriteByte(254)
+		binary.Write(&buf, binary.LittleEndian, uint32(messageLen))
+	} else {
+		buf.WriteByte(255)
+		binary.Write(&buf, binary.LittleEndian, uint64(messageLen))
+	}
+	
+	buf.WriteString(message)
+	return buf.String()
+}
+
+// verifySignatureWithCrypto uses crypto library to verify the signature directly
+func verifySignatureWithCrypto(message []byte, signature, pubKey []byte) (bool, error) {
+	// 1. Hash the message using Bitcoin's double SHA-256
+	messageHash := hashBitcoinMessage([]byte(formatBitcoinMessage(string(message))))
+	
+	// 2. Parse the public key
+	parsedPubKey, err := btcec.ParsePubKey(pubKey, btcec.S256())
+	if err != nil {
+		return false, fmt.Errorf("failed to parse public key: %w", err)
+	}
+	
+	// 3. Parse the signature (Bitcoin's compact signature format)
+	// The signature format is [R || S] where each component is 32 bytes
+	if len(signature) != 64 && len(signature) != 65 {
+		return false, fmt.Errorf("invalid signature length: %d", len(signature))
+	}
+	
+	var sig *btcec.Signature
+	if len(signature) == 65 {
+		// Compact signature format with recovery ID
+		recoveryID := signature[0] - 27
+		r := new(big.Int).SetBytes(signature[1:33])
+		s := new(big.Int).SetBytes(signature[33:65])
+		sig = &btcec.Signature{R: r, S: s}
+	} else {
+		// Standard 64-byte [R || S] format
+		r := new(big.Int).SetBytes(signature[:32])
+		s := new(big.Int).SetBytes(signature[32:])
+		sig = &btcec.Signature{R: r, S: s}
+	}
+	
+	// 4. Verify the signature against the message hash
+	return sig.Verify(messageHash, parsedPubKey), nil
+}
+
+// hashBitcoinMessage implements Bitcoin's message hashing algorithm
+func hashBitcoinMessage(message []byte) []byte {
+	h := sha256.Sum256(message)
+	h2 := sha256.Sum256(h[:])
+	return h2[:]
 }

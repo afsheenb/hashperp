@@ -178,3 +178,22 @@ type DBPreSignedExit struct {
 func (DBPreSignedExit) TableName() string {
 	return "pre_signed_exits"
 }
+
+// DBPreSignedExit is the database model for pre-signed exit transactions
+type DBPreSignedExit struct {
+	ID           string     `gorm:"primary_key;type:uuid"`
+	VTXOID       string     `gorm:"type:uuid;not null;index"`
+	ContractID   string     `gorm:"type:uuid;not null;index"`
+	UserID       string     `gorm:"type:uuid;not null"`
+	ExitTxHex    string     `gorm:"type:text;not null"`
+	CreationTime time.Time  `gorm:"not null"`
+	IsUsed       bool       `gorm:"not null;default:false"`
+	UsedTime     *time.Time `gorm:""`
+	CreatedAt    time.Time  `gorm:"not null"`
+	UpdatedAt    time.Time  `gorm:"not null"`
+}
+
+// TableName sets the table name for DBPreSignedExit
+func (DBPreSignedExit) TableName() string {
+	return "pre_signed_exits"
+}

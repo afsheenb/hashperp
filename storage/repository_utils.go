@@ -542,3 +542,22 @@ func (r *PostgresTransactionRepository) Update(ctx context.Context, tx *hashperp
 
 	return nil
 }
+
+// convertDBPreSignedExitToPreSignedExit converts DB model to domain model
+func convertDBPreSignedExitToPreSignedExit(dbPreSignedExit *DBPreSignedExit) *hashperp.PreSignedExit {
+	preSignedExit := &hashperp.PreSignedExit{
+		ID:           dbPreSignedExit.ID,
+		VTXOID:       dbPreSignedExit.VTXOID,
+		ContractID:   dbPreSignedExit.ContractID,
+		UserID:       dbPreSignedExit.UserID,
+		ExitTxHex:    dbPreSignedExit.ExitTxHex,
+		CreationTime: dbPreSignedExit.CreationTime,
+		IsUsed:       dbPreSignedExit.IsUsed,
+	}
+	
+	if dbPreSignedExit.UsedTime != nil {
+		preSignedExit.UsedTime = dbPreSignedExit.UsedTime
+	}
+	
+	return preSignedExit
+}

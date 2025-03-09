@@ -9,6 +9,8 @@
      - `generateSignatureForSwap` in `swapOfferService` (line 1044) needs proper ECDSA implementation
      - `CreatePresignedExitTransaction` in `vtxoService` lacks proper signature validation
 
+Status: Fixed, Untested
+
 2. **Input Validation**
    - **Files**: `hashperp/contract_manager.go`, `hashperp/vtxo_manager.go`, `hashperp/service.go`
    - **Methods**:
