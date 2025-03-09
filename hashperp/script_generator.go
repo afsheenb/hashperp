@@ -1,329 +1,259 @@
-// GenerateSetupTransaction implements ScriptGenerator.GenerateSetupTransaction
-// This generates the setup transaction for the contract settlement
-func (s *scriptGeneratorService) GenerateSetupTransaction(
-	ctx context.Context,
-	contract *Contract,
-	buyerVTXO *VTXO,
-	sellerVTXO *VTXO,
-) (string, error) {
-	// In a real implementation, this would generate a Bitcoin transaction
-	// For this example, we'll just create a template transaction
-	
-	// Create a unique identifier for this transaction
-	txID := sha256Hash(fmt.Sprintf("setup-%s-%d-%s-%s", 
-		contract.ID, 
-		contract.ExpiryBlockHeight,
-		buyerVTXO.ID,
-		sellerVTXO.ID))
-	
-	// Template for setup transaction
-	setupTx := fmt.Sprintf(`
-		# Setup transaction for contract %s
-		# Transaction ID: %s
-		
-		# Inputs
-		INPUT 0: %s # Buyer's VTXO
-		INPUT 1: %s # Seller's VTXO
-		
-		# Outputs
-		OUTPUT 0: %f BTC # Contract amount
-		  SCRIPT: <coinflip_script>
-	`, contract.ID, txID, buyerVTXO.ID, sellerVTXO.ID, contract.Size)
-	
-	return setupTx, nil
-}
-
-// GenerateFinalTransaction implements ScriptGenerator.GenerateFinalTransaction
-// This generates the final transaction for the contract settlement
-func (s *scriptGeneratorService) GenerateFinalTransaction(
-	ctx context.Context,
-	contract *Contract,
-	setupTxID string,
-) (string, error) {
-	// Template for final transaction
-	finalTx := fmt.Sprintf(`
-		# Final transaction for contract %s
-		# Based on setup transaction %s
-		
-		# Inputs
-		INPUT 0: %s:0 # Output from setup transaction
-		
-		# Outputs
-		OUTPUT 0: %f BTC # Contract amount
-		  SCRIPT: 
-		    IF
-		      # Hash rate condition (based on contract type and strike rate)
-		      <hash_rate_condition>
-		      <buyer_pubkey> CHECKSIG
-		    ELSE
-		      <seller_pubkey> CHECKSIG
-		    ENDIF
-	`, contract.ID, setupTxID, setupTxID, contract.Size)
-	
-	return finalTx, nil
-}
-
-// GenerateSettlementTransaction implements ScriptGenerator.GenerateSettlementTransaction
-// This generates the settlement transaction for the contract
-func (s *scriptGeneratorService) GenerateSettlementTransaction(
-	ctx context.Context,
-	contract *Contract,
-	finalTxID string,
-	winnerID string,
-) (string, error) {
-	// Determine winner's information
-	var winnerRole string
-	if winnerID == contract.BuyerID {
-		winnerRole = "Buyer"
-	} else if winnerID == contract.SellerID {
-		winnerRole = "Seller"
-	} else {
-		return "", errors.New("invalid winner ID, must be buyer or seller")
-	}
-	
-	// Template for settlement transaction
-	settlementTx := fmt.Sprintf(`
-		# Settlement transaction for contract %s
-		# Based on final transaction %s
-		# Winner: %s (%s)
-		
-		# Inputs
-		INPUT 0: %s:0 # Output from final transaction
-		
-		# Outputs
-		OUTPUT 0: %f BTC # Contract amount
-		  SCRIPT: P2PKH to %s
-	`, contract.ID, finalTxID, winnerID, winnerRole, finalTxID, contract.Size, winnerID)
-	
-	return settlementTx, nil
-}
-
-// GenerateExitPathScripts implements ScriptGenerator.GenerateExitPathScripts
-// This generates scripts for all exit paths in case of non-cooperative behavior
-func (s *scriptGeneratorService) GenerateExitPathScripts(
-	ctx context.Context,
-	contract *Contract,
-) (map[string]string, error) {
-	exitScripts := make(map[string]string)
-	
-	// Generate timeout exit script
-	timeoutScript, err := s.generateTimeoutScript(ctx, contract)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate timeout script: %w", err)
-	}
-	exitScripts["timeout"] = timeoutScript
-	
-	// Generate VTXO sweep script
-	sweepScript, err := s.generateVTXOSweepScript(ctx, contract)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate VTXO sweep script: %w", err)
-	}
-	exitScripts["vtxo_sweep"] = sweepScript
-	
-	// Generate pre-signed exit transaction template
-	preSignedTemplate := fmt.Sprintf(`
-		# Pre-signed exit transaction template for contract %s
-		# This template would be filled in with specific signatures
-		# and broadcast in case of dispute or non-cooperation
-		
-		# Inputs
-		INPUT 0: <contract_utxo>
-		
-		# Outputs
-		OUTPUT 0: <amount> BTC to <owner_address>
-	`, contract.ID)
-	exitScripts["pre_signed_template"] = preSignedTemplate
-	
-	return exitScripts, nil
-}// Helper methods for script generation
-// These methods generate the individual script components that make up the contract
-
-// generateBuyerScriptPath creates the script path for the buyer
-func (s *scriptGeneratorService) generateBuyerScriptPath(
-	ctx context.Context,
-	contract *Contract,
-) (string, error) {
-	// In a real implementation, this would generate a Bitcoin script using Script opcodes
-	// For this example, we'll just create a template script
-	
-	// Create a unique identifier for this script
-	scriptID := sha256Hash(fmt.Sprintf("buyer-%s-%d", contract.ID, contract.ExpiryBlockHeight))
-	
-	// Template for buyer script path
-	script := fmt.Sprintf(`
-		# Buyer script path for contract %s
-		# This script would include opcodes for the buyer's conditions
-		IF
-		  # Check if hash rate is above strike rate at expiry block height
-		  <hash_rate_check>
-		  # Verify buyer's signature
-		  <buyer_pubkey> CHECKSIG
-		ELSE
-		  # Timeout condition using CSV
-		  %d CHECKSEQUENCEVERIFY DROP
-		  # Allow seller to claim
-		  <seller_pubkey> CHECKSIG
-		ENDIF
-	`, contract.ID, s.timeoutBlocks)
-	
-	return script, nil
-}
-
-// generateSellerScriptPath creates the script path for the seller
-func (s *scriptGeneratorService) generateSellerScriptPath(
-	ctx context.Context,
-	contract *Contract,
-) (string, error) {
-	// Create a unique identifier for this script
-	scriptID := sha256Hash(fmt.Sprintf("seller-%s-%d", contract.ID, contract.ExpiryBlockHeight))
-	
-	// Template for seller script path
-	script := fmt.Sprintf(`
-		# Seller script path for contract %s
-		# This script would include opcodes for the seller's conditions
-		IF
-		  # Check if hash rate is below strike rate at expiry block height
-		  <hash_rate_check>
-		  # Verify seller's signature
-		  <seller_pubkey> CHECKSIG
-		ELSE
-		  # Timeout condition using CSV
-		  %d CHECKSEQUENCEVERIFY DROP
-		  # Allow buyer to claim
-		  <buyer_pubkey> CHECKSIG
-		ENDIF
-	`, contract.ID, s.timeoutBlocks)
-	
-	return script, nil
-}
-
-// generateCooperativeSettlementScript creates the script for cooperative settlement
-func (s *scriptGeneratorService) generateCooperativeSettlementScript(
-	ctx context.Context,
-	contract *Contract,
-) (string, error) {
-	// Template for cooperative settlement script
-	script := fmt.Sprintf(`
-		# Cooperative settlement script for contract %s
-		# This script requires signatures from both parties to execute
-		2 <buyer_pubkey> <seller_pubkey> 2 CHECKMULTISIG
-	`, contract.ID)
-	
-	return script, nil
-}
-
-// generateTimeoutScript creates the script for non-cooperative timeout settlement
-func (s *scriptGeneratorService) generateTimeoutScript(
-	ctx context.Context,
-	contract *Contract,
-) (string, error) {
-	// Template for timeout script
-	script := fmt.Sprintf(`
-		# Timeout script for contract %s
-		# This script becomes valid after the timeout period
-		%d CHECKSEQUENCEVERIFY DROP
-		<initiator_pubkey> CHECKSIG
-	`, contract.ID, s.timeoutBlocks)
-	
-	return script, nil
-}
-
-// generateVTXOSweepScript creates the script for VTXO sweeping
-func (s *scriptGeneratorService) generateVTXOSweepScript(
-	ctx context.Context,
-	contract *Contract,
-) (string, error) {
-	// Template for VTXO sweep script
-	script := fmt.Sprintf(`
-		# VTXO sweep script for contract %s
-		# This script allows a user to recover their funds in case of failure
-		<owner_pubkey> CHECKSIG
-	`, contract.ID)
-	
-	return script, nil
-}
-
-// Helper function to create a SHA-256 hash and return it as a hex string
-func sha256Hash(data string) string {
-	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:])
-}
 package hashperp
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/elliptic"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math/big"
+	"strings"
 	"time"
 )
 
-// scriptGeneratorService implements the ScriptGenerator interface
-type scriptGeneratorService struct {
-	btcClient BitcoinClient
-	// Timeouts for different settlement paths (in blocks)
-	timeoutBlocks int
-}
-
-// NewScriptGeneratorService creates a new script generator service
-func NewScriptGeneratorService(
-	btcClient BitcoinClient,
-	timeoutBlocks int,
-) ScriptGenerator {
-	// If timeout blocks not specified, use a default of 144 blocks (approximately 1 day)
-	if timeoutBlocks <= 0 {
-		timeoutBlocks = 144
+// GenerateExitScript (continued)
+func (s *scriptGeneratorService) GenerateExitScript(
+	ctx context.Context,
+	scriptPath string,
+	signatureData []byte,
+) (string, error) {
+	if scriptPath == "" {
+		return "", errors.New("script path cannot be empty")
 	}
 	
-	return &scriptGeneratorService{
-		btcClient: btcClient,
-		timeoutBlocks: timeoutBlocks,
+	if signatureData == nil || len(signatureData) == 0 {
+		return "", errors.New("signature data cannot be empty")
 	}
+	
+	// Extract the public key and signature from the signature data
+	// This is a simplified approach - in a real implementation, these would be separate
+	pubKey := signatureData[:33]  // First 33 bytes as compressed public key
+	signature := signatureData[33:] // Rest as signature
+	
+	// Construct a witness template based on the script path
+	var witnessTemplate string
+	
+	switch scriptPath {
+	case "key_path", "cooperative_exit":
+		// Key path spending requires just a signature
+		witnessTemplate = fmt.Sprintf(`{
+			"type": "key_path",
+			"signature": "%s"
+		}`, hex.EncodeToString(signature))
+		
+	case "buyer_exit", "seller_exit", "timeout_exit", "emergency_exit", "vtxo_sweep":
+		// Script path spending requires signature, script, and control block
+		
+		// Extract script and control block based on scriptPath
+		scriptData, controlBlockData, err := s.getScriptAndControlBlock(ctx, scriptPath, pubKey)
+		if err != nil {
+			return "", fmt.Errorf("failed to get script and control block: %w", err)
+		}
+		
+		witnessTemplate = fmt.Sprintf(`{
+			"type": "script_path",
+			"signature": "%s",
+			"public_key": "%s",
+			"script": "%s",
+			"control_block": "%s"
+		}`, 
+		hex.EncodeToString(signature),
+		hex.EncodeToString(pubKey),
+		hex.EncodeToString(scriptData),
+		hex.EncodeToString(controlBlockData))
+		
+	default:
+		return "", fmt.Errorf("unknown script path: %s", scriptPath)
+	}
+	
+	return witnessTemplate, nil
 }
 
-// GenerateContractScripts implements ScriptGenerator.GenerateContractScripts
-// This generates all the script paths needed for a contract
-func (s *scriptGeneratorService) GenerateContractScripts(
+// getScriptAndControlBlock retrieves the script and control block for a given path
+func (s *scriptGeneratorService) getScriptAndControlBlock(
 	ctx context.Context,
-	contract *Contract,
-) (map[string]string, error) {
-	// Create a map to hold all the generated scripts
-	scripts := make(map[string]string)
-
-	// Generate buyer script path
-	buyerScriptPath, err := s.generateBuyerScriptPath(ctx, contract)
+	scriptPath string,
+	pubKey []byte,
+) ([]byte, []byte, error) {
+	// Get current block height
+	currentBlockHeight, err := s.btcClient.GetCurrentBlockHeight(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate buyer script path: %w", err)
+		return nil, nil, fmt.Errorf("failed to get current block height: %w", err)
 	}
-	scripts["buyerScriptPath"] = buyerScriptPath
-
-	// Generate seller script path
-	sellerScriptPath, err := s.generateSellerScriptPath(ctx, contract)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate seller script path: %w", err)
+	
+	// Create script based on the path
+	var script []byte
+	var version byte = 0xc0  // TapScript leaf version
+	
+	// These would typically be fetched from a repository in a real implementation
+	// Here we generate them on demand based on the public key and current state
+	
+	switch scriptPath {
+	case "buyer_exit":
+		// Allow buyer to exit after contract expiry
+		expiryHeight := currentBlockHeight + 144 // Simplified - use actual contract data in production
+		expiryEncoded := encodeScriptNum(int64(expiryHeight))
+		
+		script = append(script, expiryEncoded...)      // Push expiry block height
+		script = append(script, 0xb1)                 // OP_CHECKLOCKTIMEVERIFY
+		script = append(script, 0x75)                 // OP_DROP
+		script = append(script, byte(len(pubKey)))    // Push pubkey length
+		script = append(script, pubKey...)           // Push pubkey
+		script = append(script, 0xac)                 // OP_CHECKSIGVERIFY
+		script = append(script, 0x51)                 // OP_TRUE
+		
+	case "seller_exit":
+		// Allow seller to exit after contract expiry
+		expiryHeight := currentBlockHeight + 144 // Simplified - use actual contract data in production
+		expiryEncoded := encodeScriptNum(int64(expiryHeight))
+		
+		script = append(script, expiryEncoded...)      // Push expiry block height
+		script = append(script, 0xb1)                 // OP_CHECKLOCKTIMEVERIFY
+		script = append(script, 0x75)                 // OP_DROP
+		script = append(script, byte(len(pubKey)))    // Push pubkey length
+		script = append(script, pubKey...)           // Push pubkey
+		script = append(script, 0xac)                 // OP_CHECKSIGVERIFY
+		script = append(script, 0x51)                 // OP_TRUE
+		
+	case "timeout_exit":
+		// Allow exit after settlement timeout
+		timeoutHeight := currentBlockHeight + 288 // Simplified - use actual contract data in production
+		timeoutEncoded := encodeScriptNum(int64(timeoutHeight))
+		
+		script = append(script, timeoutEncoded...)     // Push timeout block height
+		script = append(script, 0xb1)                 // OP_CHECKLOCKTIMEVERIFY
+		script = append(script, 0x75)                 // OP_DROP
+		script = append(script, byte(len(pubKey)))    // Push pubkey length
+		script = append(script, pubKey...)           // Push pubkey
+		script = append(script, 0xac)                 // OP_CHECKSIGVERIFY
+		script = append(script, 0x51)                 // OP_TRUE
+		
+	case "emergency_exit", "vtxo_sweep":
+		// Emergency exit after extended timeout
+		emergencyHeight := currentBlockHeight + 1440 // Simplified - use actual contract data in production
+		emergencyEncoded := encodeScriptNum(int64(emergencyHeight))
+		
+		script = append(script, emergencyEncoded...)   // Push emergency block height
+		script = append(script, 0xb1)                 // OP_CHECKLOCKTIMEVERIFY
+		script = append(script, 0x75)                 // OP_DROP
+		script = append(script, byte(len(pubKey)))    // Push pubkey length
+		script = append(script, pubKey...)           // Push pubkey
+		script = append(script, 0xac)                 // OP_CHECKSIGVERIFY
+		script = append(script, 0x51)                 // OP_TRUE
+		
+	default:
+		return nil, nil, fmt.Errorf("unknown script path: %s", scriptPath)
 	}
-	scripts["sellerScriptPath"] = sellerScriptPath
-
-	// Generate cooperative settlement script
-	cooperativeSettlementScript, err := s.generateCooperativeSettlementScript(ctx, contract)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate cooperative settlement script: %w", err)
-	}
-	scripts["cooperativeSettlementScript"] = cooperativeSettlementScript
-
-	// Generate non-cooperative settlement script (timeout)
-	timeoutScript, err := s.generateTimeoutScript(ctx, contract)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate timeout script: %w", err)
-	}
-	scripts["timeoutScript"] = timeoutScript
-
-	// Generate VTXO sweep script
-	sweepScript, err := s.generateVTXOSweepScript(ctx, contract)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate VTXO sweep script: %w", err)
-	}
-	scripts["sweepScript"] = sweepScript
-
-	return scripts, nil
+	
+	// Generate control block
+	// For a full implementation, this would compute the proper Merkle path
+	// to verify the script was committed to in the Taproot output
+	
+	// Simulate control block generation with key + merkle path
+	controlBlock := []byte{version}  // Leaf version
+	controlBlock = append(controlBlock, pubKey...)  // Internal key
+	
+	// Add a simulated Merkle path (in production, this would be the actual path)
+	merkleNode1 := sha256.Sum256([]byte("merkle_node_1"))
+	merkleNode2 := sha256.Sum256([]byte("merkle_node_2"))
+	controlBlock = append(controlBlock, merkleNode1[:]...)
+	controlBlock = append(controlBlock, merkleNode2[:]...)
+	
+	return script, controlBlock, nil
 }
+
+// Helper functions
+
+// canonicalOrder returns two byte slices in lexicographic order
+func canonicalOrder(a, b []byte) ([]byte, []byte) {
+	if bytes.Compare(a, b) <= 0 {
+		return a, b
+	}
+	return b, a
+}
+
+// taggedHash performs the BIP-340 tagged hash operation
+func taggedHash(tag string, data []byte) []byte {
+	tagHash := sha256.Sum256([]byte(tag))
+	taggedData := append(tagHash[:], tagHash[:]...)
+	taggedData = append(taggedData, data...)
+	result := sha256.Sum256(taggedData)
+	return result[:]
+}
+
+// encodeCompactSize encodes an integer as a Bitcoin CompactSize
+func encodeCompactSize(n uint64) []byte {
+	if n < 253 {
+		return []byte{byte(n)}
+	} else if n <= 0xffff {
+		buf := make([]byte, 3)
+		buf[0] = 253
+		binary.LittleEndian.PutUint16(buf[1:], uint16(n))
+		return buf
+	} else if n <= 0xffffffff {
+		buf := make([]byte, 5)
+		buf[0] = 254
+		binary.LittleEndian.PutUint32(buf[1:], uint32(n))
+		return buf
+	} else {
+		buf := make([]byte, 9)
+		buf[0] = 255
+		binary.LittleEndian.PutUint64(buf[1:], n)
+		return buf
+	}
+}
+
+// encodeScriptNum encodes an integer as a Bitcoin Script number
+func encodeScriptNum(n int64) []byte {
+	if n == 0 {
+		return []byte{}
+	}
+	
+	abs := n
+	if abs < 0 {
+		abs = -abs
+	}
+	
+	result := []byte{}
+	
+	for abs > 0 {
+		result = append(result, byte(abs&0xff))
+		abs >>= 8
+	}
+	
+	// If the most significant byte has its high bit set,
+	// add an extra byte to make it positive
+	if len(result) > 0 && result[len(result)-1]&0x80 != 0 {
+		if n < 0 {
+			result = append(result, 0x80)
+		} else {
+			result = append(result, 0x00)
+		}
+	} else if n < 0 {
+		result[len(result)-1] |= 0x80
+	}
+	
+	return result
+}
+
+// generateTransactionID creates a stable ID for a contract transaction
+func generateTransactionID(contract *Contract, buyerVTXO *VTXO, sellerVTXO *VTXO) string {
+	// Create a unique identifier that's stable across implementations
+	data := fmt.Sprintf("%s_%s_%s_%d_%f",
+		contract.ID,
+		buyerVTXO.ID,
+		sellerVTXO.ID,
+		contract.ExpiryBlockHeight,
+		contract.Size)
+	
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
+}
+
+// Missing imports
+import (
+	"bytes"
+)

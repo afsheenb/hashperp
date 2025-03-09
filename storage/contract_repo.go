@@ -458,7 +458,303 @@ func (r *PostgresOrderRepository) Create(ctx context.Context, order *hashperp.Or
 	return nil
 }
 
-// Additional repository implementations would follow the same pattern...
-// For the sake of brevity, I'll skip the rest of the OrderRepository, 
-// SwapOfferRepository, TransactionRepository, etc. implementations, 
-// as they follow the same approach.
+// FindAll returns all contracts in the system
+func (r *PostgresContractRepository) FindAll(ctx context.Context) ([]*hashperp.Contract, error) {
+	var dbContracts []DBContract
+	result := r.db.WithContext(ctx).Find(&dbContracts)
+	
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to find contracts: %w", result.Error)
+	}
+	
+	contracts := make([]*hashperp.Contract, len(dbContracts))
+	for i, dbContract := range dbContracts {
+		contracts[i] = convertDBContractToContract(&dbContract)
+	}
+	
+	return contracts, nil
+}
+
+// CountActiveByContract counts active VTXOs for a contract
+func (r *PostgresVTXORepository) CountActiveByContract(ctx context.Context, contractID string) (int, error) {
+	var count int64
+	result := r.db.WithContext(ctx).Model(&DBVTXO{}).
+		Where("contract_id = ? AND is_active = true", contractID).
+		Count(&count)
+	
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to count active VTXOs: %w", result.Error)
+	}
+	
+	return int(count), nil
+}
+
+// FindActiveByContract finds active VTXOs for a contract
+func (r *PostgresVTXORepository) FindActiveByContract(ctx context.Context, contractID string) ([]*hashperp.VTXO, error) {
+	var dbVTXOs []DBVTXO
+	result := r.db.WithContext(ctx).
+		Where("contract_id = ? AND is_active = true", contractID).
+		Find(&dbVTXOs)
+	
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to find active VTXOs: %w", result.Error)
+	}
+	
+	vtxos := make([]*hashperp.VTXO, len(dbVTXOs))
+	for i, dbVTXO := range dbVTXOs {
+		vtxos[i] = convertDBVTXOToVTXO(&dbVTXO)
+	}
+	
+	return vtxos, nil
+}
+
+// PostgresSwapOfferRepository implements the SwapOfferRepository interface
+type PostgresSwapOfferRepository struct {
+	db *gorm.DB
+}
+
+// NewPostgresSwapOfferRepository creates a new PostgreSQL-based swap offer repository
+func NewPostgresSwapOfferRepository(db *gorm.DB) hashperp.SwapOfferRepository {
+	return &PostgresSwapOfferRepository{
+		db: db,
+	}
+}
+
+// Create creates a new swap offer
+func (r *PostgresSwapOfferRepository) Create(ctx context.Context, offer *hashperp.SwapOffer) error {
+	dbSwapOffer := &DBSwapOffer{
+		ID:           offer.ID,
+		OfferorID:    offer.OfferorID,
+		VTXOID:       offer.VTXOID,
+		ContractID:   offer.ContractID,
+		OfferedRate:  offer.OfferedRate,
+		CreationTime: offer.CreationTime,
+		ExpiryTime:   offer.ExpiryTime,
+		Status:       offer.Status,
+	}
+	
+	if offer.AcceptorID != "" {
+		dbSwapOffer.AcceptorID = sql.NullString{
+			String: offer.AcceptorID,
+			Valid:  true,
+		}
+	}
+	
+	// Store additional fields if set
+	if offer.TargetUserID != "" {
+		dbSwapOffer.TargetUserID = sql.NullString{
+			String: offer.TargetUserID,
+			Valid:  true,
+		}
+	}
+	
+	if offer.SwapType != "" {
+		dbSwapOffer.SwapType = sql.NullString{
+			String: offer.SwapType,
+			Valid:  true,
+		}
+	}
+	
+	if len(offer.RelatedEntities) > 0 {
+		relatedEntitiesJSON, err := json.Marshal(offer.RelatedEntities)
+		if err != nil {
+			return fmt.Errorf("failed to marshal related entities: %w", err)
+		}
+		
+		dbSwapOffer.RelatedEntities = relatedEntitiesJSON
+	}
+	
+	result := r.db.WithContext(ctx).Create(dbSwapOffer)
+	if result.Error != nil {
+		return fmt.Errorf("failed to create swap offer: %w", result.Error)
+	}
+	
+	return nil
+}
+
+// FindByID retrieves a swap offer by ID
+func (r *PostgresSwapOfferRepository) FindByID(ctx context.Context, id string) (*hashperp.SwapOffer, error) {
+	var dbSwapOffer DBSwapOffer
+	result := r.db.WithContext(ctx).Where("id = ?", id).First(&dbSwapOffer)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to find swap offer: %w", result.Error)
+	}
+	
+	return convertDBSwapOfferToSwapOffer(&dbSwapOffer)
+}
+
+// FindByUser retrieves all swap offers for a specific user
+func (r *PostgresSwapOfferRepository) FindByUser(ctx context.Context, userID string, isOfferor bool) ([]*hashperp.SwapOffer, error) {
+	var dbSwapOffers []DBSwapOffer
+	var query *gorm.DB
+	
+	if isOfferor {
+		query = r.db.WithContext(ctx).Where("offeror_id = ?", userID)
+	} else {
+		query = r.db.WithContext(ctx).Where("acceptor_id = ? OR target_user_id = ?", userID, userID)
+	}
+	
+	result := query.Find(&dbSwapOffers)
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to find swap offers by user: %w", result.Error)
+	}
+	
+	swapOffers := make([]*hashperp.SwapOffer, 0, len(dbSwapOffers))
+	for _, dbSwapOffer := range dbSwapOffers {
+		swapOffer, err := convertDBSwapOfferToSwapOffer(&dbSwapOffer)
+		if err != nil {
+			continue // Skip offers we can't convert
+		}
+		swapOffers = append(swapOffers, swapOffer)
+	}
+	
+	return swapOffers, nil
+}
+
+// FindByContract retrieves all swap offers for a specific contract
+func (r *PostgresSwapOfferRepository) FindByContract(ctx context.Context, contractID string) ([]*hashperp.SwapOffer, error) {
+	var dbSwapOffers []DBSwapOffer
+	result := r.db.WithContext(ctx).Where("contract_id = ?", contractID).Find(&dbSwapOffers)
+	
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to find swap offers by contract: %w", result.Error)
+	}
+	
+	swapOffers := make([]*hashperp.SwapOffer, 0, len(dbSwapOffers))
+	for _, dbSwapOffer := range dbSwapOffers {
+		swapOffer, err := convertDBSwapOfferToSwapOffer(&dbSwapOffer)
+		if err != nil {
+			continue // Skip offers we can't convert
+		}
+		swapOffers = append(swapOffers, swapOffer)
+	}
+	
+	return swapOffers, nil
+}
+
+// FindOpenOffersByVTXO retrieves all open swap offers for a specific VTXO
+func (r *PostgresSwapOfferRepository) FindOpenOffersByVTXO(ctx context.Context, vtxoID string) ([]*hashperp.SwapOffer, error) {
+	var dbSwapOffers []DBSwapOffer
+	result := r.db.WithContext(ctx).
+		Where("vtxo_id = ? AND status = ?", vtxoID, string(hashperp.OFFER_OPEN)).
+		Find(&dbSwapOffers)
+	
+	if result.Error != nil {
+		return nil, fmt.Errorf("failed to find open swap offers by VTXO: %w", result.Error)
+	}
+	
+	swapOffers := make([]*hashperp.SwapOffer, 0, len(dbSwapOffers))
+	for _, dbSwapOffer := range dbSwapOffers {
+		swapOffer, err := convertDBSwapOfferToSwapOffer(&dbSwapOffer)
+		if err != nil {
+			continue // Skip offers we can't convert
+		}
+		swapOffers = append(swapOffers, swapOffer)
+	}
+	
+	return swapOffers, nil
+}
+
+// Update updates an existing swap offer
+func (r *PostgresSwapOfferRepository) Update(ctx context.Context, offer *hashperp.SwapOffer) error {
+	dbSwapOffer := &DBSwapOffer{
+		ID:           offer.ID,
+		OfferorID:    offer.OfferorID,
+		VTXOID:       offer.VTXOID,
+		ContractID:   offer.ContractID,
+		OfferedRate:  offer.OfferedRate,
+		CreationTime: offer.CreationTime,
+		ExpiryTime:   offer.ExpiryTime,
+		Status:       offer.Status,
+	}
+	
+	if offer.AcceptorID != "" {
+		dbSwapOffer.AcceptorID = sql.NullString{
+			String: offer.AcceptorID,
+			Valid:  true,
+		}
+	}
+	
+	// Store additional fields if set
+	if offer.TargetUserID != "" {
+		dbSwapOffer.TargetUserID = sql.NullString{
+			String: offer.TargetUserID,
+			Valid:  true,
+		}
+	}
+	
+	if offer.SwapType != "" {
+		dbSwapOffer.SwapType = sql.NullString{
+			String: offer.SwapType,
+			Valid:  true,
+		}
+	}
+	
+	if len(offer.RelatedEntities) > 0 {
+		relatedEntitiesJSON, err := json.Marshal(offer.RelatedEntities)
+		if err != nil {
+			return fmt.Errorf("failed to marshal related entities: %w", err)
+		}
+		
+		dbSwapOffer.RelatedEntities = relatedEntitiesJSON
+	}
+	
+	result := r.db.WithContext(ctx).Save(dbSwapOffer)
+	if result.Error != nil {
+		return fmt.Errorf("failed to update swap offer: %w", result.Error)
+	}
+	
+	return nil
+}
+
+// Delete deletes a swap offer by ID
+func (r *PostgresSwapOfferRepository) Delete(ctx context.Context, id string) error {
+	result := r.db.WithContext(ctx).Delete(&DBSwapOffer{}, "id = ?", id)
+	if result.Error != nil {
+		return fmt.Errorf("failed to delete swap offer: %w", result.Error)
+	}
+	return nil
+}
+
+// convertDBSwapOfferToSwapOffer converts a database model to domain model
+func convertDBSwapOfferToSwapOffer(dbSwapOffer *DBSwapOffer) (*hashperp.SwapOffer, error) {
+	swapOffer := &hashperp.SwapOffer{
+		ID:           dbSwapOffer.ID,
+		OfferorID:    dbSwapOffer.OfferorID,
+		VTXOID:       dbSwapOffer.VTXOID,
+		ContractID:   dbSwapOffer.ContractID,
+		OfferedRate:  dbSwapOffer.OfferedRate,
+		CreationTime: dbSwapOffer.CreationTime,
+		ExpiryTime:   dbSwapOffer.ExpiryTime,
+		Status:       dbSwapOffer.Status,
+	}
+	
+	if dbSwapOffer.AcceptorID.Valid {
+		swapOffer.AcceptorID = dbSwapOffer.AcceptorID.String
+	}
+	
+	if dbSwapOffer.TargetUserID.Valid {
+		swapOffer.TargetUserID = dbSwapOffer.TargetUserID.String
+	}
+	
+	if dbSwapOffer.SwapType.Valid {
+		swapOffer.SwapType = dbSwapOffer.SwapType.String
+	}
+	
+	// Parse related entities if set
+	if dbSwapOffer.RelatedEntities != nil {
+		var relatedEntities map[string]string
+		err := json.Unmarshal(dbSwapOffer.RelatedEntities, &relatedEntities)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal related entities: %w", err)
+		}
+		swapOffer.RelatedEntities = relatedEntities
+	} else {
+		swapOffer.RelatedEntities = make(map[string]string)
+	}
+	
+	return swapOffer, nil
+}
